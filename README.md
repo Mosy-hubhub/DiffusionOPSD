@@ -40,6 +40,9 @@
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/License-Apache_2.0-16A34A?style=for-the-badge&logo=apache&logoColor=white" alt="Apache 2.0 License">
   </a>
+  <a href="https://diffusionopsd.github.io/blog/v2/">
+    <img src="https://img.shields.io/badge/V2-Blog-B0448C?style=for-the-badge&logo=rss&logoColor=white" alt="V2 Blog">
+  </a>
 </p>
 
 <br>
