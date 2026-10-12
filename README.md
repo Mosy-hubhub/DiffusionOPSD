@@ -44,7 +44,7 @@
 
 <br>
 
-<img src="assets/opsd_v2.png" width="100%" alt="DiffusionOPSD v2 training overview">
+<a href="https://diffusionopsd.github.io/blog/v2/"><img src="assets/opsd_v2.png" width="100%" alt="DiffusionOPSD v2 training overview"></a>
 
 </div>
 
