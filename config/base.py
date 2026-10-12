@@ -108,4 +108,9 @@ def get_config():
     ###### Per-Prompt Stat Tracking ######
     config.per_prompt_stat_tracking = True
 
+    config.efficiency = ml_collections.ConfigDict({
+        "query_prefix": False, "cache_old_query": False, "ddp_no_sync": False,
+        "cache_sd3_text": False, "cache_clip_text": False,
+    })
+
     return config

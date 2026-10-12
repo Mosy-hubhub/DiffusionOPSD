@@ -11,7 +11,8 @@ Design:
   image tokens) regardless of content, so the tokenized text (input_ids/attention_mask/image_grid_thw) is
   identical for a given prompt set. We therefore build the text batch via the official `prepare_batch` with a
   dummy PIL image (correct tokenization), then OVERRIDE `pixel_values` with the differentiable per-image
-  `_preprocess(img01, do_rescale=False)` output (same shape). Text correctness = official; image grad = ours.
+  `preprocess_tensor(img01, do_rescale=False)` output. This public path applies the official CLIP
+  normalization defaults; the private `_preprocess` path does not. Text correctness and image grad remain.
 - reward = model(**batch)["logits"][:, 0]  (mu).
 """
 
@@ -63,7 +64,7 @@ class HPSv3Scorer(torch.nn.Module):
 
     def _diff_pixel_values(self, images01: torch.Tensor):
         """Per-image differentiable preprocess -> (pixel_values, image_grid_thw). images01: [B,3,H,W] in [0,1].
-        _preprocess_differentiable conflates batch with the temporal axis, so call it PER image and concat."""
+        The tensor processor conflates batch with the temporal axis, so call it PER image and concat."""
         # The model FIXES the input grid at 256*28*28 px -> 448x448 (14-px patch, 2x2 merge -> 16x16 = 256
         # image tokens, matching the dummy-image tokenization in prepare_batch). Feeding the raw rollout
         # resolution (e.g. 512) makes the differentiable smart_resize compute a mismatched grid (504) that the
@@ -74,11 +75,11 @@ class HPSv3Scorer(torch.nn.Module):
             ).clamp(0, 1)
         fps, grids = [], []
         for i in range(images01.shape[0]):
-            fp, (gt, gh, gw) = self.ip._preprocess(images01[i:i + 1], do_rescale=False)  # tensor -> diff path
-            fps.append(fp)
-            grids.append([gt, gh, gw])
+            processed = self.ip.preprocess_tensor(images01[i:i + 1], do_rescale=False)
+            fps.append(processed["pixel_values"])
+            grids.append(processed["image_grid_thw"])
         pixel_values = torch.cat(fps, dim=0).to(self.dtype)
-        image_grid_thw = torch.tensor(grids, device=images01.device)
+        image_grid_thw = torch.stack(grids, dim=0).to(images01.device)
         return pixel_values, image_grid_thw
 
     def _scores(self, images01: torch.Tensor, prompts: Sequence[str]) -> torch.Tensor:

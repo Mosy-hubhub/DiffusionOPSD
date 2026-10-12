@@ -198,7 +198,8 @@ def zimage_rollout(pipe, prompt_embeds_list: List[torch.Tensor], num_inference_s
                    height: int, width: int, device, generator: Optional[torch.Generator] = None,
                    guidance_scale: float = 0.0, decode: bool = True,
                    latents: Optional[torch.Tensor] = None,
-                   stop_before_index: Optional[int] = None) -> dict:
+                   stop_before_index: Optional[int] = None,
+                   stop_before_sigma: Optional[float] = None) -> dict:
     """Run the Turbo denoising loop and return per-step rollout tensors + decoded images.
 
     Returns a dict:
@@ -243,6 +244,10 @@ def zimage_rollout(pipe, prompt_embeds_list: List[torch.Tensor], num_inference_s
     sigmas = scheduler.sigmas.to(device).float()          # (num_steps+1,), last ~0
     timesteps = scheduler.timesteps.to(device).float()    # (num_steps,)
     num_steps = len(timesteps)
+    if stop_before_sigma is not None:
+        if stop_before_index is not None:
+            raise ValueError("choose either stop_before_index or stop_before_sigma")
+        stop_before_index = zimage_query_sigma_index(sigmas, stop_before_sigma)
     if stop_before_index is not None and not 0 <= int(stop_before_index) < num_steps:
         raise ValueError(
             f"stop_before_index must select a denoiser call in [0,{num_steps - 1}], "

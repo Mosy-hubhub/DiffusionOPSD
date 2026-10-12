@@ -57,6 +57,7 @@ from diffusionopsd.experiment_io import (
 )
 from diffusionopsd.metrics import install_wandb_jsonl_tee
 from ml_collections import config_flags
+from diffusionopsd.opsd_v2 import apply_opsd_v2, validate_query_prefix
 from torch.cuda.amp import GradScaler, autocast as torch_autocast
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
@@ -467,6 +468,9 @@ def main(_):
         logger.info(f"[diff-bridge] policy rank={rank} policy_world_size={world_size} "
                     f"(heavy diff reward server=rank {_server_rank})")
 
+    apply_opsd_v2(config, backbone="zimage", policy_world_size=world_size)
+    query_prefix = validate_query_prefix(config, backbone="zimage")
+
     unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
     config.run_name = (config.run_name + "_" + unique_id) if config.run_name else unique_id
 
@@ -590,12 +594,16 @@ def main(_):
     test_dataloader = DataLoader(test_dataset, batch_size=config.sample.test_batch_size, sampler=test_sampler,
                                  collate_fn=test_dataset.collate_fn, num_workers=0, pin_memory=True)
 
+    neutral_advantage = getattr(config.train, "adv_mode", "all") == "neutral"
+    if neutral_advantage and config.sample.num_image_per_prompt != 1:
+        raise ValueError("Neutral endpoint weighting requires K=1")
     if config.sample.num_image_per_prompt == 1:
         config.per_prompt_stat_tracking = False
     if config.per_prompt_stat_tracking:
         stat_tracker = PerPromptStatTracker(config.sample.global_std)
     else:
-        assert False
+        if not neutral_advantage:
+            raise ValueError("K=1 requires explicit neutral endpoint weighting")
 
     executor = futures.ThreadPoolExecutor(max_workers=8)
     reward_fn = getattr(diffusionopsd.rewards, "multi_score")(device, config.reward_fn)
@@ -708,36 +716,48 @@ def main(_):
                 with torch.no_grad():
                     out = zimage_rollout(pipeline, prompt_embeds_list, num_inference_steps=config.sample.num_steps,
                                          height=config.resolution, width=config.resolution, device=device,
-                                         guidance_scale=config.sample.guidance_scale, decode=True)
+                                         guidance_scale=config.sample.guidance_scale, decode=not query_prefix,
+                                         stop_before_sigma=opa_query_sigma if query_prefix else None)
             transformer_ddp.module.set_adapter("default")
 
-            images = out["images"]
-            x0 = out["x0"]
+            images = out.get("images")
             sigmas = out["sigmas"]                                       # (num_steps+1,)
             timesteps = out["timesteps"].repeat(len(prompts), 1).to(device)
             # OPA query state: fixed index from the scheduler sigma schedule (~=0.273 @ step 8).
             kq = zimage_query_sigma_index(sigmas, opa_query_sigma)
             z_q = out["latents"][kq].detach()                           # (B,C,H,W) real rollout state
             sig_q = float(sigmas[kq].item())
+            # The guarded prefix path replaces both targets at the query anchor.
+            # Keep the tensor shape contract without presenting z_q as an endpoint.
+            x0 = z_q if query_prefix else out["x0"]
 
             base_idx = len(epoch_prompt_embeds)
             embed_idx = torch.arange(base_idx, base_idx + len(prompts), device=device)
             epoch_prompt_embeds.extend([e.detach() for e in prompt_embeds_list])
 
-            rewards_future = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
-            time.sleep(0)
-            samples_data_list.append({
+            sample = {
                 "prompt_ids": prompt_ids,
                 "embed_idx": embed_idx,
                 "timesteps": timesteps,
                 "latents_clean": x0,
                 "opa_z_q": z_q,
                 "opa_sig_q": torch.full((len(prompts),), sig_q, device=device),
-                "rewards_future": rewards_future,
-            })
+            }
+            if query_prefix:
+                # Neutral K1 fitting does not use endpoint scores. Actual query
+                # rewards are recorded below from the OPA gradient forward.
+                sample["rewards"] = {key: torch.zeros(len(prompts), device=device)
+                                     for key in (*config.reward_fn, "avg")}
+            else:
+                sample["rewards_future"] = executor.submit(
+                    reward_fn, images, prompts, prompt_metadata, only_strict=True)
+                time.sleep(0)
+            samples_data_list.append(sample)
 
         for sample_item in tqdm(samples_data_list, desc="Waiting for rewards",
                                 disable=not is_main_process(rank), position=0):
+            if query_prefix:
+                continue
             rewards, _ = sample_item["rewards_future"].result()
             sample_item["rewards"] = {k: torch.as_tensor(v, device=device).float() for k, v in rewards.items()}
             del sample_item["rewards_future"]
@@ -749,7 +769,7 @@ def main(_):
             for k in samples_data_list[0].keys()
         }
 
-        if epoch % 10 == 0 and is_main_process(rank):
+        if not query_prefix and epoch % 10 == 0 and is_main_process(rank):
             images_to_log = images.cpu()
             rewards_to_log = collated_samples["rewards"]["avg"][-len(images_to_log):].cpu()
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -764,7 +784,7 @@ def main(_):
         collated_samples["rewards"]["avg"] = collated_samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
         gathered_rewards_dict = {k: gather_tensor_to_all(v, world_size).numpy()
                                  for k, v in collated_samples["rewards"].items()}
-        if is_main_process(rank):
+        if not query_prefix and is_main_process(rank):
             wandb.log({"epoch": epoch, **{f"reward_{k}": v.mean() for k, v in gathered_rewards_dict.items()
                                           if "_strict_accuracy" not in k and "_accuracy" not in k}}, step=global_step)
 
@@ -786,6 +806,14 @@ def main(_):
                            **dispersion_stats,
                            "mean_reward_10": stat_tracker.get_mean_of_top_rewards(10)}, step=global_step)
             stat_tracker.clear()
+        elif neutral_advantage:
+            # K=1 has no within-prompt ranking; OPA still supplies reward-gradient targets.
+            advantages = np.zeros_like(gathered_rewards_dict["avg"])
+            prompt_ids_all = gather_tensor_to_all(collated_samples["prompt_ids"], world_size)
+            if not query_prefix and is_main_process(rank):
+                prompts_all_decoded = pipeline.tokenizer.batch_decode(prompt_ids_all.cpu().numpy(), skip_special_tokens=True)
+                write_raw_reward_jsonl(config.save_dir, epoch=epoch, global_step=global_step,
+                                       prompts=prompts_all_decoded, rewards=gathered_rewards_dict)
         else:
             avg = gathered_rewards_dict["avg"]
             advantages = (avg - avg.mean()) / (avg.std() + 1e-4)
@@ -809,6 +837,7 @@ def main(_):
         opa_res = torch.zeros(Bn, device=device)
         sig_q = float(collated_samples["opa_sig_q"][0].item())
         rs_q = collated_samples["opa_z_q"]
+        query_anchor_rewards = []
         for s in range(0, Bn, opa_mb):
             e = min(s + opa_mb, Bn)
             zq = rs_q[s:e].float()
@@ -828,6 +857,8 @@ def main(_):
             if opa_dir_mode == "grad" and opa_n_ascent > 0:  # n_ascent=0 => _opa_tr_step does no ascent, so don't pay/count g0
                 _xg = y0.detach().float().requires_grad_(True)
                 _rg = _reward_of_latents_grad(pipeline, ri_scorer, opa_kind, _xg, prm)
+                if query_prefix:
+                    query_anchor_rewards.append(_rg.detach())
                 (opa_g0,) = torch.autograd.grad(_rg.sum(), _xg)
                 profiling.reward_bwd_inc()  # §6: the shared y0 reward-gradient backward
             y_plus = _opa_tr_step(pipeline, ri_scorer, opa_kind, y0, prm, opa_rho, opa_n_ascent, opa_eta,
@@ -841,6 +872,17 @@ def main(_):
             opa_ym[s:e] = y_minus.to(opa_ym.dtype)
             opa_res[s:e] = (y_plus - y0).flatten(1).norm(dim=1) / (y0.flatten(1).norm(dim=1) + 1e-8)
         transformer_ddp.module.set_adapter("default")
+        if query_prefix:
+            anchor_scores = gather_tensor_to_all(torch.cat(query_anchor_rewards), world_size).numpy()
+            if is_main_process(rank):
+                prompts_all_decoded = pipeline.tokenizer.batch_decode(prompt_ids_all.cpu().numpy(), skip_special_tokens=True)
+                anchor_rewards = {opa_kind: anchor_scores, "avg": anchor_scores}
+                write_raw_reward_jsonl(config.save_dir, epoch=epoch, global_step=global_step,
+                                       prompts=prompts_all_decoded, rewards=anchor_rewards,
+                                       reward_scope="query_anchor")
+                wandb.log({"epoch": epoch, "train_reward_scope": "query_anchor",
+                           f"reward_{opa_kind}": float(anchor_scores.mean()),
+                           "reward_avg": float(anchor_scores.mean())}, step=global_step)
         collated_samples["opa_y_plus"] = opa_yp
         collated_samples["opa_y_minus"] = opa_ym
         collated_samples["opa_acc_plus"] = opa_ap

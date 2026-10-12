@@ -1,4 +1,4 @@
-"""Canonical paper hyperparameters for SD3.5-M and Z-Image-Turbo."""
+"""Base hyperparameters with DiffusionOPSD v2 enabled by default."""
 
 from __future__ import annotations
 
@@ -12,14 +12,14 @@ _COMMON_OPSD_DEFAULT = {
     "opa": 1,
     "opa_margin": 0.005,
     "opa_n_ascent": 2,
+    "v2": True,  # Trainers resolve the complete accelerated recipe at startup.
     "opa_eta": 1.0,
     "opa_mb": 6,
     "opa_dual_neg": 1,
     "opa_cert": 0,
     "opa_dir_mode": "grad",
-    # Mechanism ablations described in the paper appendix. Defaults below reproduce the
-    # canonical OPSD method byte-for-byte; only the ablation launcher flips them. Each gates a
-    # REAL alternate code path in the OPA loss block of train_opsd_ri_sd3.py (not a config relabel).
+    # Mechanism ablations described in the paper appendix. Set v2=False when
+    # reproducing the original recipe or endpoint-dependent ablations.
     "opa_state_mode": "rollout",   # rollout(method, on-policy z_q) | forward (offline forward-noised z_q)
     "opa_target_mode": "replace",  # replace(method, refined target IS the endpoint) | aux (NFT-endpoint + λ·reward-grad)
     "opa_aux_lambda": 1.0,         # auxiliary-loss weight; consumed only when opa_target_mode="aux"

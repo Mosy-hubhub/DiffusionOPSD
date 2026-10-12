@@ -52,6 +52,7 @@ def pipeline_with_logprob(
     model_type: str = "sd3",
     stop_before_index: Optional[int] = None,
     decode: bool = True,
+    stop_before_sigma: Optional[float] = None,
 ):
     height = height or self.default_sample_size * self.vae_scale_factor
     width = width or self.default_sample_size * self.vae_scale_factor
@@ -251,6 +252,12 @@ def pipeline_with_logprob(
     # 6. Prepare image embeddings
     all_latents = [latents]
     all_log_probs = []
+
+    # Keep the complete schedule so stopping preserves the native DPM2 prefix.
+    if stop_before_sigma is not None:
+        if stop_before_index is not None:
+            raise ValueError("Specify a stop index or a query sigma, not both.")
+        stop_before_index = max(1, int(torch.argmin((sigmas[:-1] - stop_before_sigma).abs()).item()))
 
     # 7. Denoising loop
     if stop_before_index is not None and not 0 <= int(stop_before_index) < len(timesteps):

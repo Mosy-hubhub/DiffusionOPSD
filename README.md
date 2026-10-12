@@ -8,7 +8,7 @@
 **Reward-guided diffusion post-training through explicit, continually refreshed intermediate targets**
 
 <p align="center">
-  Wei Zhou<sup>1,2</sup>, Xiongwei Zhu<sup>1</sup>, Lingdong Kong<sup>2</sup>, Bo Chen<sup>1</sup>, Lei Zhang<sup>3</sup>, Yongyuan Liang<sup>4</sup>, Xiaoxia Hou<sup>1</sup>, Ye Tian<sup>5</sup>,<br>
+  Wei Zhou<sup>1,2</sup>, Xiongwei Zhu<sup>1</sup>, Lingdong Kong<sup>2</sup>, Bo Chen<sup>1</sup>, Lei Zhang<sup>3</sup>, Yongyuan Liang<sup>4</sup>, Xiaoxia Hou<sup>1</sup>, Tian Ye<sup>5</sup>,<br>
   Xian Sun<sup>6</sup>, Yingshuo Wang<sup>7</sup>, Linfeng Li<sup>2</sup>, Shengqiong Wu<sup>8</sup>, Leigang Qu<sup>2</sup>, Feng Li<sup>9</sup>,<br> Wei Liu<sup>1,†</sup>, Julian McAuley<sup>3</sup>, Tat-Seng Chua<sup>2</sup>
 </p>
 <p align="center">
@@ -42,7 +42,15 @@
   </a>
 </p>
 
-<br><br>
+<br>
+
+<img src="assets/opsd_v2.png" width="100%" alt="DiffusionOPSD v2 training overview">
+
+</div>
+
+🔥 DiffusionOPSD turns image-level reward guidance into explicit targets for clean-output predictions at sampled queries. In v2, we keep that principle and make the training recipe more efficient: **one reward-ascent step for target construction, broader prompt coverage, and rollouts that stop at the query.** The controlled experiment preserves held-out performance while reducing training GPU time by approximately **30.5%**. A separate measurement of one complete update with the old and new recipes reduces update time by **39.7%**.
+
+<div align="center">
 
 <img src="assets/qualitative_gallery.png" width="100%" alt="DiffusionOPSD qualitative gallery">
 
@@ -129,18 +137,20 @@ Reward-specific checkpoints are evaluated on their matched held-out objective. H
 
 | Method | Pick | CLIP | HPSv2.1 | Aes | ImgR | HPSv3 | DeQA | AltCLIP | Point | Pair |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ReFL | 23.92 | 0.308 | 0.358 | **12.09** | 1.28 | 9.33 | 4.85 | 0.408 | 0.193 | 0.290 |
-| DiffusionNFT | 23.43 | 0.298 | 0.336 | 9.11 | 1.46 | 9.14 | 4.76 | 0.412 | 0.199 | 0.323 |
-| **DiffusionOPSD** | **24.94** | **0.340** | **0.390** | 12.08 | **1.76** | **13.34** | **4.94** | **0.450** | **0.214** | **0.465** |
+| ReFL | <u>23.92</u> | 0.308 | <u>0.358</u> | **12.09** | 1.28 | 6.18 | <u>4.85</u> | 0.408 | 0.193 | 0.290 |
+| DiffusionNFT | 23.43 | 0.298 | 0.336 | 9.11 | 1.46 | 13.51 | 4.76 | 0.412 | 0.199 | 0.323 |
+| **DiffusionOPSD** | **24.94** | **0.340** | **0.390** | <u>12.08</u> | **1.76** | **15.14** | **4.94** | <u>0.450</u> | <u>0.214</u> | **0.465** |
+| **DiffusionOPSD\*** | **24.94** | <u>0.327</u> | **0.390** | **12.09** | <u>1.73</u> | <u>14.79</u> | 4.81 | **0.458** | **0.216** | <u>0.463</u> |
 
 ### Z-Image-Turbo
 
 | Method | Pick | CLIP | HPSv2.1 | Aes | ImgR | HPSv3 | DeQA | AltCLIP | Point | Pair |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| FlowGRPO | 22.96 | 0.275 | 0.305 | 5.46 | 1.01 | 7.11 | 4.51 | 0.394 | 0.217 | 0.420 |
-| ReFL | 24.54 | 0.313 | 0.380 | 9.79 | 1.37 | 13.77 | 4.60 | 0.441 | 0.227 | 0.481 |
-| DiffusionNFT | 22.28 | 0.280 | 0.277 | 6.07 | 0.58 | 1.58 | 3.37 | 0.363 | 0.166 | 0.357 |
-| **DiffusionOPSD** | **25.15** | **0.320** | **0.390** | **10.74** | **1.79** | **14.44** | **4.78** | **0.451** | **0.243** | **0.551** |
+| FlowGRPO | 22.96 | 0.275 | 0.305 | 5.46 | 1.01 | 11.58 | 4.51 | 0.394 | 0.217 | 0.420 |
+| ReFL | 24.54 | 0.313 | 0.380 | 9.79 | 1.37 | 11.32 | 4.60 | 0.441 | 0.227 | 0.481 |
+| DiffusionNFT | 22.28 | 0.280 | 0.277 | 6.07 | 0.58 | 11.01 | 3.37 | 0.363 | 0.166 | 0.357 |
+| **DiffusionOPSD** | <u>25.15</u> | **0.320** | **0.390** | <u>10.74</u> | **1.79** | **15.59** | **4.78** | <u>0.451</u> | <u>0.243</u> | **0.551** |
+| **DiffusionOPSD\*** | **25.28** | <u>0.314</u> | <u>0.386</u> | **10.80** | <u>1.76</u> | <u>15.51</u> | <u>4.77</u> | **0.459** | **0.249** | <u>0.549</u> |
 
 ### Training efficiency
 
@@ -358,6 +368,8 @@ python scripts/smoke_reward_gradient.py --reward hpsv2
 ```
 
 ### Full reward-specific training
+
+The training scripts enable the accelerated DiffusionOPSD v2 recipe by default.
 
 ```bash
 NPROC=8 UPDATES=100 OUTPUT_DIR=outputs/sd35_hpsv2 \

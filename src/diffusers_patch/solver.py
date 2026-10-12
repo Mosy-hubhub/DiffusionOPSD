@@ -74,6 +74,15 @@ def run_sampling(
         all_latents.append(z)
         all_log_probs.append(log_prob)
 
+    if "dpm" in solver and steps_to_run < full_steps:
+        # Native deterministic DPM draws float32 noise at its first and final
+        # DDIM steps even though eta=0. Preserve those discarded draws so the
+        # next rollout batch sees the same RNG stream as a full trajectory.
+        assert determistic
+        for i in range(steps_to_run, full_steps):
+            if i == 0 or i == full_steps - 1:
+                torch.randn_like(z, dtype=torch.float32)
+
     latents = z.to(dtype)
     # all_latents = torch.stack(all_latents, dim=1)  # (batch_size, num_steps + 1, 4, 64, 64)
     # all_log_probs = torch.stack(all_log_probs, dim=1)  # (batch_size, num_steps, 1)

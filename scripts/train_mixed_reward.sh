@@ -62,6 +62,8 @@ CMD=(
   --config.save_dir="$OUTPUT_DIR"
 )
 if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
+  # Keep the explicit one-batch legacy check from expanding to a full v2 update.
+  [[ "$METHOD" != "opsd" ]] || CMD+=(--config.opsd.v2=false)
   CMD+=(
     --config.debug=true
     --config.num_epochs=1

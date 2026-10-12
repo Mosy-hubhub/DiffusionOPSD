@@ -130,6 +130,7 @@ def write_raw_reward_jsonl(
     global_step: int,
     prompts: Sequence[str],
     rewards: Mapping[str, np.ndarray],
+    reward_scope: str | None = None,
 ) -> str:
     """Persist unnormalized per-rollout reward values for later curves/distributions."""
     out_dir = Path(save_dir) / "train_rewards"
@@ -148,5 +149,6 @@ def write_raw_reward_jsonl(
                 "sample_index": idx,
                 "prompt": prompt,
                 "rewards_raw": values,
+                **({"reward_scope": reward_scope} if reward_scope is not None else {}),
             }, ensure_ascii=False) + "\n")
     return str(out)

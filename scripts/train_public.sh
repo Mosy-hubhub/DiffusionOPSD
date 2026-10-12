@@ -66,6 +66,7 @@ if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
   # Preserve the paper's K trajectories per prompt while reducing a pilot to
   # one globally group-complete rollout batch and one optimizer update.
   CMD+=(
+    --config.opsd.v2=false
     --config.debug=true
     --config.sample.num_batches_per_epoch=1
     --config.train.gradient_accumulation_steps=1
