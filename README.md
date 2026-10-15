@@ -1,3 +1,5 @@
+> **Schedule-Free ReFL branch.** For the ReFL experiments in *Large Diffusion Models Need More Than EMA*, see [README_SCHEDULEFREE.md](README_SCHEDULEFREE.md). It contains the HPSv3 ReFL baseline, SF 4x and SF 20x commands, shared settings, added parameters, and paper results. The original DiffusionOPSD documentation follows below.
+
 *Note: This is an external implementation of the algorithm in the following paper:*
 
 

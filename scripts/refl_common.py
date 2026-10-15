@@ -96,6 +96,31 @@ def derive_gradient_accumulation_steps(
     return int(trajectories_per_update) // denominator
 
 
+def adamw_warmup_steps(rr: Any) -> int:
+    """Return the plain-AdamW linear warmup length."""
+    return max(0, int(getattr(rr, "adamw_warmup_steps", 0)))
+
+
+def apply_adamw_linear_warmup(
+    optimizer: torch.optim.Optimizer,
+    base_lr: float,
+    update_index: int,
+    warmup_steps: int,
+) -> float:
+    """Set and return the AdamW LR for the upcoming optimizer update.
+
+    ``update_index`` is zero-based. With ``warmup_steps=5``, updates 1..5 use
+    1/5, 2/5, ..., 5/5 of ``base_lr``; later updates keep the full LR. The
+    function is stateless, so resume follows the restored update count.
+    """
+    lr = float(base_lr)
+    if int(warmup_steps) > 0:
+        lr *= min(1.0, float(int(update_index) + 1) / float(int(warmup_steps)))
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+    return lr
+
+
 def _randperm(n: int, seed: int) -> list[int]:
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
     return torch.randperm(n, generator=generator).tolist()
@@ -561,14 +586,21 @@ def save_refl_checkpoint(
     optimizer,
     scaler,
     provenance: dict[str, str],
+    checkpoint_format: str = "adamw_ema",
     group=None,
 ) -> str:
     """Save a complete resumable checkpoint through a staging directory.
 
-    ``lora`` remains the EMA adapter used for evaluation compatibility;
-    ``resume_lora`` stores the raw optimizer policy.  The final checkpoint
+    AdamW checkpoints store both the online policy and explicit EMA state.
+    Schedule-Free checkpoints export the optimizer eval-mode x adapter both as
+    a standard PEFT ``lora`` directory and in the legacy ``ema.pt`` slot, then
+    rely on ``optimizer.pt`` for resumable z state. The final checkpoint
     directory only appears after every file and the completion marker exist.
     """
+    if checkpoint_format not in {"adamw_ema", "schedulefree_x"}:
+        raise ValueError(f"unknown ReFL checkpoint format: {checkpoint_format}")
+    if checkpoint_format == "adamw_ema" and ema is None:
+        raise ValueError("adamw_ema checkpoints require an EMA state")
     final = os.path.join(save_dir, "checkpoints", f"checkpoint-{global_step}")
     marker = os.path.join(final, "checkpoint_complete.json")
     import numpy as np
@@ -604,16 +636,29 @@ def save_refl_checkpoint(
         try:
             os.makedirs(staging, exist_ok=False)
             model_to_save = model.module if hasattr(model, "module") else model
-            model_to_save.save_pretrained(os.path.join(staging, "resume_lora"))
-            ema.copy_ema_to(trainable_parameters, store_temp=True)
-            try:
+            if checkpoint_format == "schedulefree_x":
+                from peft.utils.save_and_load import get_peft_model_state_dict
+
                 model_to_save.save_pretrained(os.path.join(staging, "lora"))
-            finally:
-                ema.copy_temp_to(trainable_parameters)
+                try:
+                    sf_x_state = get_peft_model_state_dict(model_to_save, adapter_name="default")
+                except TypeError:
+                    sf_x_state = get_peft_model_state_dict(model_to_save)
+                torch.save(
+                    sf_x_state,
+                    os.path.join(staging, "ema.pt"),
+                )
+            else:
+                model_to_save.save_pretrained(os.path.join(staging, "resume_lora"))
+                ema.copy_ema_to(trainable_parameters, store_temp=True)
+                try:
+                    model_to_save.save_pretrained(os.path.join(staging, "lora"))
+                finally:
+                    ema.copy_temp_to(trainable_parameters)
+                torch.save(ema.state_dict(), os.path.join(staging, "ema.pt"))
             torch.save(optimizer.state_dict(), os.path.join(staging, "optimizer.pt"))
             if scaler is not None:
                 torch.save(scaler.state_dict(), os.path.join(staging, "scaler.pt"))
-            torch.save(ema.state_dict(), os.path.join(staging, "ema.pt"))
             torch.save(rng_states, os.path.join(staging, "rng_states.pt"))
             write_json(
                 os.path.join(staging, "trainer_state.json"),
@@ -626,6 +671,7 @@ def save_refl_checkpoint(
                     "global_step": int(global_step),
                     "implementation_revision": REFL_IMPLEMENTATION_REVISION,
                     "checkpoint_before_online_eval": True,
+                    "checkpoint_format": checkpoint_format,
                     "completed_unix_ns": time.time_ns(),
                     "provenance": provenance,
                 },
@@ -659,8 +705,11 @@ def load_refl_checkpoint(
     scaler,
     device: torch.device,
     expected_provenance: dict[str, str],
+    checkpoint_format: str = "adamw_ema",
     group=None,
 ) -> int:
+    if checkpoint_format not in {"adamw_ema", "schedulefree_x"}:
+        raise ValueError(f"unknown ReFL checkpoint format: {checkpoint_format}")
     marker_path = os.path.join(checkpoint, "checkpoint_complete.json")
     marker = read_json(marker_path)
     if marker.get("implementation_revision") != REFL_IMPLEMENTATION_REVISION:
@@ -669,14 +718,25 @@ def load_refl_checkpoint(
     for key in ("refl_trainer_sha256", "refl_config_sha256", "refl_matrix_sha256"):
         if recorded_provenance.get(key) != expected_provenance.get(key):
             raise RuntimeError(f"checkpoint provenance mismatch for {key}")
+    saved_format = marker.get("checkpoint_format", "adamw_ema")
+    if saved_format != checkpoint_format:
+        raise RuntimeError(
+            f"checkpoint format mismatch: saved={saved_format}, requested={checkpoint_format}"
+        )
     from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
 
-    raw_lora = os.path.join(checkpoint, "resume_lora")
-    state = _retry_io(
-        f"load LoRA {raw_lora}",
-        lambda: load_peft_weights(raw_lora, device=str(device)),
-    )
     model_to_load = model.module if hasattr(model, "module") else model
+    if checkpoint_format == "schedulefree_x":
+        state = _retry_io(
+            f"load Schedule-Free x LoRA {checkpoint}",
+            lambda: torch.load(os.path.join(checkpoint, "ema.pt"), map_location=device),
+        )
+    else:
+        raw_lora = os.path.join(checkpoint, "resume_lora")
+        state = _retry_io(
+            f"load LoRA {raw_lora}",
+            lambda: load_peft_weights(raw_lora, device=str(device)),
+        )
     set_peft_model_state_dict(model_to_load, state, adapter_name="default")
     optimizer_state = _retry_io(
         f"load optimizer {checkpoint}",
@@ -690,11 +750,12 @@ def load_refl_checkpoint(
             lambda: torch.load(scaler_path, map_location=device),
         )
         scaler.load_state_dict(scaler_state)
-    ema_state = _retry_io(
-        f"load EMA {checkpoint}",
-        lambda: torch.load(os.path.join(checkpoint, "ema.pt"), map_location="cpu"),
-    )
-    ema.load_state_dict(ema_state)
+    if checkpoint_format == "adamw_ema":
+        ema_state = _retry_io(
+            f"load EMA {checkpoint}",
+            lambda: torch.load(os.path.join(checkpoint, "ema.pt"), map_location="cpu"),
+        )
+        ema.load_state_dict(ema_state)
     return int(marker["global_step"])
 
 

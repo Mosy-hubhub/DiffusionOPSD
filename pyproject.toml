@@ -52,8 +52,11 @@ Documentation = "https://diffusionopsd.github.io/"
 Repository = "https://github.com/worldbench/DiffusionOPSD"
 
 [tool.setuptools]
-packages = ["diffusionopsd", "diffusionopsd.diffusers_patch"]
-package-dir = {diffusionopsd = "src"}
+packages = ["diffusionopsd", "diffusionopsd.diffusers_patch", "schedulefree"]
+package-dir = {diffusionopsd = "src", schedulefree = "schedulefree"}
+
+[tool.setuptools.package-data]
+schedulefree = ["LICENSE"]
 
 [tool.ruff]
 line-length = 120

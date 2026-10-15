@@ -8,6 +8,7 @@ import os
 import platform
 import socket
 import time
+from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.distributed as dist
@@ -24,6 +25,8 @@ from scripts.refl_common import (
     REWARDS,
     ZIMAGE_DIFF_BRIDGE_REWARDS,
     append_jsonl,
+    adamw_warmup_steps,
+    apply_adamw_linear_warmup,
     assert_output_under_allowed_remote_root,
     build_update_records,
     choose_late_index,
@@ -51,9 +54,44 @@ from scripts.refl_common import (
 
 FLAGS = runtime.FLAGS
 
+try:
+    from schedulefree import AdamWScheduleFree
+except ImportError:
+    AdamWScheduleFree = None
+
 
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _optimizer_name(rr) -> str:
+    return str(getattr(rr, "optimizer", "adamw")).lower()
+
+
+def _uses_schedulefree(rr) -> bool:
+    return _optimizer_name(rr) == "adamw_schedulefree"
+
+
+def _set_optimizer_train_mode(optimizer, train_mode: bool) -> None:
+    method = getattr(optimizer, "train" if train_mode else "eval", None)
+    if callable(method):
+        method()
+
+
+@contextmanager
+def _eval_weight_context(optimizer, ema, trainable_parameters, use_schedulefree: bool):
+    if use_schedulefree:
+        _set_optimizer_train_mode(optimizer, False)
+        try:
+            yield
+        finally:
+            _set_optimizer_train_mode(optimizer, True)
+    else:
+        ema.copy_ema_to(trainable_parameters, store_temp=True)
+        try:
+            yield
+        finally:
+            ema.copy_temp_to(trainable_parameters)
 
 
 def _preencode_records(pipeline, records, rank: int, world_size: int, device, batch_size: int = 4):
@@ -145,7 +183,7 @@ def _forward_reward(pipeline, scorer, reward: str, x0: torch.Tensor, prompts):
 
 def _evaluate(
     *, pipeline, model, scorer, reward, encoded_batches, manifest_records, config, device, group, rank,
-    output_path: str, update: int | str, score_scale: float,
+    output_path: str, update: int | str, score_scale: float, save_images_dir: str | None = None,
 ):
     local_indices, local_scores = [], []
     model.eval()
@@ -163,6 +201,14 @@ def _evaluate(
                 guidance_scale=0.0, decode=True,
             )
         images = out["images"].detach().float()
+        if save_images_dir:
+            from PIL import Image
+            os.makedirs(save_images_dir, exist_ok=True)
+            arrays = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+            for record, array in zip(records, arrays):
+                Image.fromarray(array.transpose(1, 2, 0)).save(
+                    os.path.join(save_images_dir, f"{int(record['index']):04d}.png")
+                )
         score_batch = 1 if reward in EVAL_SCORE_BATCH_ONE_REWARDS else len(records)
         for start in range(0, len(records), score_batch):
             chunk = records[start : start + score_batch]
@@ -370,11 +416,34 @@ def main(_):
     if pipeline.transformer is not rollout_transformer:
         raise RuntimeError("PEFT unexpectedly replaced the pipeline's raw Z-Image transformer")
     trainable = [parameter for parameter in model.module.parameters() if parameter.requires_grad]
-    optimizer = torch.optim.AdamW(
-        trainable, lr=float(rr.learning_rate), betas=(config.train.adam_beta1, config.train.adam_beta2),
-        weight_decay=float(rr.weight_decay), eps=config.train.adam_epsilon,
+    optimizer_name = _optimizer_name(rr)
+    use_schedulefree = _uses_schedulefree(rr)
+    adamw_warmup = 0 if use_schedulefree else adamw_warmup_steps(rr)
+    if use_schedulefree:
+        if AdamWScheduleFree is None:
+            raise ImportError("config.refl.optimizer='adamw_schedulefree' requires the local schedulefree package")
+        optimizer = AdamWScheduleFree(
+            trainable,
+            lr=float(rr.learning_rate),
+            betas=(config.train.adam_beta1, config.train.adam_beta2),
+            weight_decay=float(rr.weight_decay),
+            eps=config.train.adam_epsilon,
+            warmup_steps=int(rr.schedulefree_warmup_steps),
+            r=float(rr.schedulefree_r),
+            weight_lr_power=float(rr.schedulefree_weight_lr_power),
+            inner_momentum=float(rr.schedulefree_inner_momentum),
+        )
+    elif optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            trainable, lr=float(rr.learning_rate), betas=(config.train.adam_beta1, config.train.adam_beta2),
+            weight_decay=float(rr.weight_decay), eps=config.train.adam_epsilon,
+        )
+    else:
+        raise ValueError(f"unsupported ReFL optimizer: {optimizer_name}")
+    ema = None if use_schedulefree else runtime.EMAModuleWrapper(
+        trainable, decay=0.9, update_step_interval=1, device=device
     )
-    ema = runtime.EMAModuleWrapper(trainable, decay=0.9, update_step_interval=1, device=device)
+    checkpoint_format = "schedulefree_x" if use_schedulefree else "adamw_ema"
 
     provenance = provenance_from_env()
     resume_checkpoint = str(config.resume_from or "")
@@ -388,8 +457,10 @@ def main(_):
             scaler=scaler,
             device=device,
             expected_provenance=provenance,
+            checkpoint_format=checkpoint_format,
             group=group,
         )
+    _set_optimizer_train_mode(optimizer, True)
     dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
 
     train_records = load_prompt_records(os.path.join(config.dataset, "train.txt"))
@@ -455,8 +526,7 @@ def main(_):
     eval0_started = time.perf_counter()
     eval0 = None
     if not resume_checkpoint:
-        ema.copy_ema_to(trainable, store_temp=True)
-        try:
+        with _eval_weight_context(optimizer, ema, trainable, use_schedulefree):
             eval0 = _evaluate(
                 pipeline=pipeline, model=model.module, scorer=scorer, reward=reward,
                 encoded_batches=encoded_curve, manifest_records=curve_records, config=config, device=device,
@@ -464,8 +534,6 @@ def main(_):
                 output_path=os.path.join(config.save_dir, "curve", "update_0000.json"), update=0,
                 score_scale=score_scale,
             )
-        finally:
-            ema.copy_temp_to(trainable)
     elif rank == 0 and not os.path.isfile(os.path.join(config.save_dir, "curve", "update_0000.json")):
         raise RuntimeError("resumable checkpoint exists but update-0 evaluation is missing")
     update0_eval_seconds = time.perf_counter() - eval0_started if not resume_checkpoint else 0.0
@@ -507,6 +575,15 @@ def main(_):
         "artifact_storage": "config.save_dir",
         "calibration": {"mean": calibration_mean, "std": calibration_std,
                         "one_step_late_state": bool(rr.standardize_reward)},
+        "optimizer": {
+            "name": optimizer_name,
+            "checkpoint_format": checkpoint_format,
+            "explicit_ema": ema is not None,
+            "learning_rate": float(rr.learning_rate),
+            "adamw_warmup_steps": adamw_warmup,
+            "schedulefree_warmup_steps": int(rr.schedulefree_warmup_steps) if use_schedulefree else 0,
+            "schedulefree_inner_momentum": float(rr.schedulefree_inner_momentum) if use_schedulefree else 0.0,
+        },
         "config": config.to_dict(), "provenance": provenance,
         "phase_timing_seconds": {
             "initialization": initialization_seconds,
@@ -563,8 +640,7 @@ def main(_):
 
     if replay_boundary_online_eval:
         online_eval_started = time.perf_counter()
-        ema.copy_ema_to(trainable, store_temp=True)
-        try:
+        with _eval_weight_context(optimizer, ema, trainable, use_schedulefree):
             result = _evaluate(
                 pipeline=pipeline, model=model.module, scorer=scorer, reward=reward,
                 encoded_batches=encoded_curve, manifest_records=curve_records,
@@ -574,8 +650,6 @@ def main(_):
                 ),
                 update=global_step, score_scale=score_scale,
             )
-        finally:
-            ema.copy_temp_to(trainable)
         if rank == 0 and result is not None:
             eval_seconds = time.perf_counter() - online_eval_started
             cumulative_online_eval_seconds += eval_seconds
@@ -687,10 +761,18 @@ def main(_):
         grad_norm = float(grad_norm_tensor.detach())
         if bool(rr.fail_on_nonfinite_or_zero_grad):
             require_finite_nonzero("gradient norm", grad_norm)
+        current_lr = (
+            apply_adamw_linear_warmup(
+                optimizer, float(rr.learning_rate), global_step, adamw_warmup
+            )
+            if optimizer_name == "adamw"
+            else float(optimizer.param_groups[0]["lr"])
+        )
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         global_step += 1
-        ema.step(trainable, global_step)
+        if ema is not None:
+            ema.step(trainable, global_step)
         cumulative_trajectories += int(rr.trajectories_per_update)
 
         step_seconds_tensor = torch.tensor(time.perf_counter() - step_started, device=device)
@@ -718,6 +800,7 @@ def main(_):
             **_flatten_metrics("late_sigma", sigma_stats),
             **_flatten_metrics("late_timestep_index", late_stats),
             "loss": loss_stats["mean"], "grad_norm": float(grad_sync),
+            "learning_rate": current_lr,
             "step_seconds": float(step_seconds_tensor),
             "cumulative_train_seconds": cumulative_train_seconds,
             "training_compute_gpu_hours": (
@@ -746,25 +829,30 @@ def main(_):
                 break
 
         if global_step % int(rr.checkpoint_every) == 0 or global_step == int(rr.num_updates):
-            save_refl_checkpoint(
-                config.save_dir,
-                global_step=global_step,
-                rank=rank,
-                model=model,
-                trainable_parameters=trainable,
-                ema=ema,
-                config=config,
-                optimizer=optimizer,
-                scaler=scaler,
-                provenance=provenance,
-                group=group,
+            checkpoint_context = (
+                _eval_weight_context(optimizer, ema, trainable, use_schedulefree)
+                if use_schedulefree else nullcontext()
             )
+            with checkpoint_context:
+                save_refl_checkpoint(
+                    config.save_dir,
+                    global_step=global_step,
+                    rank=rank,
+                    model=model,
+                    trainable_parameters=trainable,
+                    ema=ema,
+                    config=config,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    provenance=provenance,
+                    checkpoint_format=checkpoint_format,
+                    group=group,
+                )
             dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
 
         if global_step % int(rr.eval_every) == 0 or global_step == int(rr.num_updates):
             online_eval_started = time.perf_counter()
-            ema.copy_ema_to(trainable, store_temp=True)
-            try:
+            with _eval_weight_context(optimizer, ema, trainable, use_schedulefree):
                 result = _evaluate(
                     pipeline=pipeline, model=model.module, scorer=scorer, reward=reward,
                     encoded_batches=encoded_curve, manifest_records=curve_records,
@@ -772,8 +860,6 @@ def main(_):
                     output_path=os.path.join(config.save_dir, "curve", f"update_{global_step:04d}.json"),
                     update=global_step, score_scale=score_scale,
                 )
-            finally:
-                ema.copy_temp_to(trainable)
             if rank == 0 and result is not None:
                 eval_seconds = time.perf_counter() - online_eval_started
                 cumulative_online_eval_seconds += eval_seconds
@@ -803,17 +889,15 @@ def main(_):
         runtime.cleanup_distributed()
         return
     final_eval_started = time.perf_counter()
-    ema.copy_ema_to(trainable, store_temp=True)
-    try:
+    with _eval_weight_context(optimizer, ema, trainable, use_schedulefree):
         final_result = _evaluate(
             pipeline=pipeline, model=model.module, scorer=scorer, reward=reward,
             encoded_batches=encoded_final, manifest_records=final_records,
             config=config, device=device, group=group, rank=rank,
             output_path=os.path.join(config.save_dir, "final_eval", "result.json"),
             update="final", score_scale=score_scale,
+            save_images_dir=os.path.join(config.save_dir, "final_eval", "images"),
         )
-    finally:
-        ema.copy_temp_to(trainable)
     if rank == 0 and final_result is not None:
         write_json(os.path.join(config.save_dir, "final_eval", "per_image.json"), final_result["per_image"], rank=rank)
     final_eval_seconds = time.perf_counter() - final_eval_started

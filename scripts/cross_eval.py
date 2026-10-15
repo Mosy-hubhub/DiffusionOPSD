@@ -334,7 +334,11 @@ def save_generated_images(
     with open(os.path.join(images_dir, "prompts.jsonl"), "w") as handle:
         for idx, (image, prompt) in enumerate(zip(images_cpu, prompts)):
             array = (image.clamp(0, 1).numpy().transpose(1, 2, 0) * 255).round().astype(np.uint8)
-            filename = f"{idx:04d}.png"
+            # A native-generation shard may start at a non-zero global prompt
+            # index.  Use that global index for the artifact name as well as
+            # the manifest; otherwise two shards both write 0000.png, … and
+            # silently overwrite each other.
+            filename = f"{global_start_idx + idx:04d}.png"
             Image.fromarray(array).save(os.path.join(images_dir, filename))
             handle.write(json.dumps({"index": global_start_idx + idx, "file": filename, "prompt": prompt}, ensure_ascii=False) + "\n")
 
